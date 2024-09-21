@@ -27,8 +27,9 @@ python3 main.py --model large --translation-lang English --threshold 0.0005
 ```
 
 ## To be Implemented
-- Simple GUI
 - Overlay of Transcribed Text
+- Speech to Translated Speech Function
+- Simple GUI
 - Optimizing Memory Usage
 - Increased Translation Accuracy
 - Faster Translation / Transcription
