@@ -1,0 +1,13 @@
+{
+  "subtitle_y_offset": 184,
+  "subtitle_x_offset": -5,
+  "font_family": "Segoe UI",
+  "font_size": 16,
+  "source_language": "Auto-detect",
+  "target_language": "English",
+  "audio_device": "Auto (Recommended)",
+  "audio_device_data": -1,
+  "whisper_model": "turbo",
+  "audio_threshold": 0.001,
+  "performance_mode": false
+}

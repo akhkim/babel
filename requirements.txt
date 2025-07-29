@@ -1,0 +1,8 @@
+PyQt5>=5.15.0
+sounddevice>=0.4.0
+numpy>=1.21.0
+Pillow>=8.0.0
+faster-whisper>=0.9.0
+googletrans==4.0.0rc1
+scipy>=1.7.0
+torch>=1.9.0
