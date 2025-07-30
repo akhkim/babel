@@ -1,6 +1,6 @@
 # Babel - Real-time Audio Translation with Subtitle Overlay
 
-**English | [Español](README_ES.md) | [Français](README_FR.md) | [Deutsch](README_DE.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [中文](README_ZH.md)**
+**English | [Español](docs/translations/README_ES.md) | [Français](docs/translations/README_FR.md) | [Deutsch](docs/translations/README_DE.md) | [日本語](docs/translations/README_JA.md) | [한국어](docs/translations/README_KO.md) | [中文](docs/translations/README_ZH.md)**
 
 A Python application that captures your PC's internal audio, translates it in real-time using Faster-Whisper and Google Translate, and displays translated subtitles as an overlay on your screen.
 
