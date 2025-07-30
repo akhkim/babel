@@ -1,18 +1,965 @@
+"""
+Enhanced Babel - Real-time Audio Translation with Faster-Whisper
+
+Features:
+  • PyQt5 control window with full language control
+  • Audio device selection (Auto-detect or manual selection)
+  • Source language selection for Whisper transcription
+  • Target language selection for translation output
+  • Configurable audio level threshold
+  • Uses Faster-Whisper for improved speed and performance
+  • Real-time translation and subtitle overlay
+  • Optimized for low latency and memory usage
+
+Requirements (Python >= 3.9):
+    pip install PyQt5 sounddevice numpy scipy pillow faster-whisper googletrans==4.0.0rc1
+"""
 import warnings
+# Suppress the ctranslate2 deprecation warning
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 
 import sys, queue, threading, platform, ctypes, time, gc, json, traceback
+from pathlib import Path
+
+import numpy as np
+import sounddevice as sd
+from faster_whisper import WhisperModel
+from googletrans import Translator
+from scipy import signal
+
 from PyQt5 import QtCore, QtGui, QtWidgets
-from audio import AudioWorker, NLPWorker
-from config import (
-    config, DEBUG_MODE, DEFAULT_AUDIO_THRESHOLD, WHISPER_MODEL_KEYS, 
-    CURRENT_UI_LANGUAGE, TARGETS, WHISPER_SOURCE_LANGUAGES,
-    load_translations, get_ui_text, get_whisper_model_description,
-    get_available_ui_languages, get_native_language_names,
-    get_language_by_native_name, translate_language_name,
-    get_translated_source_languages, get_translated_target_languages,
-    get_original_language_name, get_available_input_devices, initialize_audio_device
-)
+import torch
+
+# ──────────────────────────── AUDIO CONFIGURATION ───────────────────── #
+# Configure WASAPI for shared mode to fix audio capture during calls/meetings
+WASAPI_HOST_API = None
+WASAPI_SETTINGS = None
+
+if platform.system() == "Windows":
+    try:
+        # Find WASAPI host API
+        for i, api in enumerate(sd.query_hostapis()):
+            if 'wasapi' in api['name'].lower():
+                WASAPI_HOST_API = i
+                break
+        
+        if WASAPI_HOST_API is not None:
+            # Create shared mode settings
+            WASAPI_SETTINGS = sd.WasapiSettings(exclusive=False)
+            print(f"✅ WASAPI shared mode configured (Host API: {WASAPI_HOST_API}) - audio capture will work during calls")
+        else:
+            print("⚠️  WASAPI host API not found - using default audio settings")
+    except Exception as e:
+        print(f"⚠️  Could not configure WASAPI shared mode: {e}")
+        print("   Audio capture may not work during calls or when other apps use audio")
+
+# ──────────────────────────── USER SETTINGS ─────────────────────────── #
+DEVICE_INDEX = None    # Will be auto-detected at startup
+SAMPLE_RATE  = 48_000
+CHUNK_SECONDS           = 3     # Reduced from 4 to 2 for lower latency
+MODEL_NAME              = "turbo"    # Use turbo model by default
+DEBUG_MODE              = False     # Disable debug output for performance
+DEFAULT_AUDIO_THRESHOLD = 0.001     # Increased threshold to reduce processing
+MAX_QUEUE_SIZE          = 3         # Limit queue size to reduce memory usage
+
+# Available Whisper models (used as keys for translation lookup)
+WHISPER_MODEL_KEYS = ["tiny", "turbo", "large-v3", "distil-large-v3"]
+
+# Global UI language and translation system
+CURRENT_UI_LANGUAGE = "English"
+TRANSLATIONS = {}
+
+def load_translations():
+    """Load translation files from the translations directory"""
+    global TRANSLATIONS
+    translation_dir = Path(__file__).parent / "translations"
+    
+    # Language code mappings
+    language_files = {
+        "English": "en.json",
+        "Spanish": "es.json", 
+        "French": "fr.json",
+        "German": "de.json",
+        "Portuguese": "pt.json",
+        "Korean": "ko.json"
+    }
+    
+    for language, filename in language_files.items():
+        try:
+            file_path = translation_dir / filename
+            if file_path.exists():
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    TRANSLATIONS[language] = json.load(f)
+            else:
+                print(f"Warning: Translation file {filename} not found")
+        except Exception as e:
+            print(f"Error loading translation {filename}: {e}")
+    
+    # Fallback to English if no translations loaded
+    if not TRANSLATIONS:
+        TRANSLATIONS["English"] = {
+            "ui": {"app_name": "Babel", "app_subtitle": "Live Translation"},
+            "whisper_models": {
+                "tiny": "Fast but basic accuracy",
+                "turbo": "Balanced speed/accuracy", 
+                "large-v3": "High accuracy but slower",
+                "distil-large-v3": "Optimized large model"
+            },
+            "audio_devices": {}
+        }
+
+def get_ui_text(key, category="ui"):
+    """Get translated text for the current language"""
+    if not TRANSLATIONS:
+        load_translations()
+    
+    current_lang = TRANSLATIONS.get(CURRENT_UI_LANGUAGE)
+    if not current_lang:
+        current_lang = TRANSLATIONS.get("English", {})
+    
+    return current_lang.get(category, {}).get(key, key)
+
+def get_whisper_model_description(model_key):
+    """Get translated Whisper model description"""
+    return get_ui_text(model_key, "whisper_models")
+
+def get_available_ui_languages():
+    """Get list of available UI languages"""
+    if not TRANSLATIONS:
+        load_translations()
+    return list(TRANSLATIONS.keys())
+
+def get_native_language_names():
+    """Get UI languages displayed in their native language names"""
+    native_names = {
+        "English": "English",
+        "Spanish": "Español", 
+        "French": "Français",
+        "German": "Deutsch",
+        "Portuguese": "Português",
+        "Korean": "한국어"
+    }
+    
+    available_languages = get_available_ui_languages()
+    return [(native_names.get(lang, lang), lang) for lang in available_languages]
+
+def get_language_by_native_name(native_name):
+    """Get the internal language key by its native display name"""
+    native_to_internal = {
+        "English": "English",
+        "Español": "Spanish", 
+        "Français": "French",
+        "Deutsch": "German",
+        "Português": "Portuguese",
+        "한국어": "Korean"
+    }
+    return native_to_internal.get(native_name, native_name)
+
+def translate_language_name(language_name):
+    """Translate specific language names that need localization"""
+    # Use hardcoded translations to avoid recursion
+    translated_name = get_ui_text(language_name, "language_names")
+    # If not found in language_names, return original
+    if translated_name == language_name:
+        # Try the old auto-detect fallback
+        if language_name == "Auto-detect":
+            return get_ui_text("auto_detect")
+        return language_name
+    return translated_name
+
+def translate_whisper_model_display(model_name, model_desc):
+    """Create translated display text for Whisper model dropdown"""
+    return f"{model_name} • {model_desc}"
+
+def get_translated_whisper_models():
+    """Get Whisper models with translated descriptions"""
+    translated_models = []
+    for model_name in WHISPER_MODEL_KEYS:
+        model_desc = get_whisper_model_description(model_name)
+        display_text = translate_whisper_model_display(model_name, model_desc)
+        translated_models.append((display_text, model_name))
+    return translated_models
+
+def get_translated_source_languages():
+    """Get source languages with translated names where appropriate"""
+    translated_langs = []
+    for lang in WHISPER_SOURCE_LANGUAGES.keys():
+        translated_langs.append(translate_language_name(lang))
+    return translated_langs
+
+def get_translated_target_languages():
+    """Get target languages with translated names where appropriate"""
+    translated_langs = []
+    for lang in TARGETS.keys():
+        translated_langs.append(translate_language_name(lang))
+    return translated_langs
+
+def get_original_language_name(translated_name):
+    """Convert translated language name back to original English name"""
+    # Handle auto-detect special case
+    if translated_name == get_ui_text("auto_detect"):
+        return "Auto-detect"
+    
+    # Search through language_names to find original
+    if TRANSLATIONS and CURRENT_UI_LANGUAGE in TRANSLATIONS:
+        language_names = TRANSLATIONS[CURRENT_UI_LANGUAGE].get("language_names", {})
+        for original, translated in language_names.items():
+            if translated == translated_name:
+                return original
+    
+    # Fallback - return as is if not found
+    return translated_name
+
+TARGETS = {
+    "Afrikaans": "af",
+    "Albanian": "sq",
+    "Amharic": "am",
+    "Arabic": "ar",
+    "Armenian": "hy",
+    "Azerbaijani": "az",
+    "Basque": "eu",
+    "Belarusian": "be",
+    "Bengali": "bn",
+    "Bosnian": "bs",
+    "Bulgarian": "bg",
+    "Catalan": "ca",
+    "Cebuano": "ceb",
+    "Chinese (Simplified)": "zh-cn",
+    "Chinese (Traditional)": "zh-tw",
+    "Corsican": "co",
+    "Croatian": "hr",
+    "Czech": "cs",
+    "Danish": "da",
+    "Dutch": "nl",
+    "English": "en",
+    "Esperanto": "eo",
+    "Estonian": "et",
+    "Finnish": "fi",
+    "French": "fr",
+    "Frisian": "fy",
+    "Galician": "gl",
+    "Georgian": "ka",
+    "German": "de",
+    "Greek": "el",
+    "Gujarati": "gu",
+    "Haitian Creole": "ht",
+    "Hausa": "ha",
+    "Hawaiian": "haw",
+    "Hebrew": "iw",
+    "Hindi": "hi",
+    "Hmong": "hmn",
+    "Hungarian": "hu",
+    "Icelandic": "is",
+    "Igbo": "ig",
+    "Indonesian": "id",
+    "Irish": "ga",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Javanese": "jw",
+    "Kannada": "kn",
+    "Kazakh": "kk",
+    "Khmer": "km",
+    "Korean": "ko",
+    "Kurdish": "ku",
+    "Kyrgyz": "ky",
+    "Lao": "lo",
+    "Latin": "la",
+    "Latvian": "lv",
+    "Lithuanian": "lt",
+    "Luxembourgish": "lb",
+    "Macedonian": "mk",
+    "Malagasy": "mg",
+    "Malay": "ms",
+    "Malayalam": "ml",
+    "Maltese": "mt",
+    "Maori": "mi",
+    "Marathi": "mr",
+    "Mongolian": "mn",
+    "Myanmar (Burmese)": "my",
+    "Nepali": "ne",
+    "Norwegian": "no",
+    "Odia (Oriya)": "or",
+    "Pashto": "ps",
+    "Persian": "fa",
+    "Polish": "pl",
+    "Portuguese": "pt",
+    "Punjabi": "pa",
+    "Romanian": "ro",
+    "Russian": "ru",
+    "Samoan": "sm",
+    "Scots Gaelic": "gd",
+    "Serbian": "sr",
+    "Sesotho": "st",
+    "Shona": "sn",
+    "Sindhi": "sd",
+    "Sinhala": "si",
+    "Slovak": "sk",
+    "Slovenian": "sl",
+    "Somali": "so",
+    "Spanish": "es",
+    "Sundanese": "su",
+    "Swahili": "sw",
+    "Swedish": "sv",
+    "Tagalog": "tl",
+    "Tajik": "tg",
+    "Tamil": "ta",
+    "Tatar": "tt",
+    "Telugu": "te",
+    "Thai": "th",
+    "Turkish": "tr",
+    "Turkmen": "tk",
+    "Ukrainian": "uk",
+    "Urdu": "ur",
+    "Uyghur": "ug",
+    "Uzbek": "uz",
+    "Vietnamese": "vi",
+    "Welsh": "cy",
+    "Xhosa": "xh",
+    "Yiddish": "yi",
+    "Yoruba": "yo",
+    "Zulu": "zu"
+}
+
+# Source languages that Whisper can transcribe from
+WHISPER_SOURCE_LANGUAGES = {
+    "Auto-detect": None,  # Let Whisper auto-detect
+    "Afrikaans": "af",
+    "Albanian": "sq",
+    "Amharic": "am",
+    "Arabic": "ar",
+    "Armenian": "hy",
+    "Azerbaijani": "az",
+    "Basque": "eu",
+    "Belarusian": "be",
+    "Bengali": "bn",
+    "Bosnian": "bs",
+    "Breton": "br",
+    "Bulgarian": "bg",
+    "Burmese": "my",
+    "Castilian": "es",
+    "Catalan": "ca",
+    "Chinese": "zh",
+    "Croatian": "hr",
+    "Czech": "cs",
+    "Danish": "da",
+    "Dutch": "nl",
+    "English": "en",
+    "Estonian": "et",
+    "Faroese": "fo",
+    "Finnish": "fi",
+    "Flemish": "nl",
+    "French": "fr",
+    "Galician": "gl",
+    "Georgian": "ka",
+    "German": "de",
+    "Greek": "el",
+    "Gujarati": "gu",
+    "Haitian": "ht",
+    "Hausa": "ha",
+    "Hawaiian": "haw",
+    "Hebrew": "he",
+    "Hindi": "hi",
+    "Hungarian": "hu",
+    "Icelandic": "is",
+    "Indonesian": "id",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Javanese": "jv",
+    "Kannada": "kn",
+    "Kazakh": "kk",
+    "Khmer": "km",
+    "Korean": "ko",
+    "Lao": "lo",
+    "Latin": "la",
+    "Latvian": "lv",
+    "Letzeburgesch": "lb",
+    "Lingala": "ln",
+    "Lithuanian": "lt",
+    "Luxembourgish": "lb",
+    "Macedonian": "mk",
+    "Malagasy": "mg",
+    "Malay": "ms",
+    "Malayalam": "ml",
+    "Maltese": "mt",
+    "Maori": "mi",
+    "Marathi": "mr",
+    "Mongolian": "mn",
+    "Nepali": "ne",
+    "Norwegian": "no",
+    "Nynorsk": "nn",
+    "Occitan": "oc",
+    "Pashto": "ps",
+    "Persian": "fa",
+    "Polish": "pl",
+    "Portuguese": "pt",
+    "Punjabi": "pa",
+    "Pushto": "ps",
+    "Romanian": "ro",
+    "Russian": "ru",
+    "Sanskrit": "sa",
+    "Serbian": "sr",
+    "Shona": "sn",
+    "Sindhi": "sd",
+    "Sinhala": "si",
+    "Slovak": "sk",
+    "Slovenian": "sl",
+    "Somali": "so",
+    "Spanish": "es",
+    "Sundanese": "su",
+    "Swahili": "sw",
+    "Swedish": "sv",
+    "Tagalog": "tl",
+    "Tajik": "tg",
+    "Tamil": "ta",
+    "Tatar": "tt",
+    "Telugu": "te",
+    "Thai": "th",
+    "Tibetan": "bo",
+    "Turkish": "tr",
+    "Turkmen": "tk",
+    "Ukrainian": "uk",
+    "Urdu": "ur",
+    "Uzbek": "uz",
+    "Valencian": "ca",
+    "Vietnamese": "vi",
+    "Welsh": "cy",
+    "Yiddish": "yi",
+    "Yoruba": "yo"
+}
+
+# Mapping from Whisper language codes to Google Translate language codes
+WHISPER_TO_GOOGLETRANS_MAPPING = {
+    "zh": "zh-cn",  # Chinese simplified
+    "he": "iw",     # Hebrew
+    "jv": "jw",     # Javanese
+    "nn": "no",     # Norwegian Nynorsk -> Norwegian
+    "oc": "ca",     # Occitan -> Catalan (closest match)
+    "ps": "ps",     # Pashto
+    "sa": "hi",     # Sanskrit -> Hindi (closest match)
+    "bo": "zh-cn",  # Tibetan -> Chinese (closest match)
+    "ca": "ca",     # Valencian -> Catalan
+}
+
+def convert_whisper_to_googletrans_code(whisper_code):
+    """Convert Whisper language code to Google Translate language code if needed"""
+    if whisper_code is None:
+        return None
+    return WHISPER_TO_GOOGLETRANS_MAPPING.get(whisper_code, whisper_code)
+
+# Translation system (loaded when application starts)
+
+# ──────────────────────────── AUDIO DEVICE MANAGEMENT ───────────────── #
+def get_available_input_devices():
+    """Get list of available input audio devices"""
+    devices = sd.query_devices()
+    input_devices = []
+    
+    for idx, device in enumerate(devices):
+        if device['max_input_channels'] > 0:
+            name = device['name']
+            # Mark special device types
+            if 'loopback' in name.lower():
+                name += " (System Audio)"
+            elif 'stereo mix' in name.lower():
+                name += " (System Audio)"
+            elif 'monitor' in name.lower():
+                name += " (System Audio)"
+            elif 'cable' in name.lower():
+                name += " (Virtual Cable)"
+            elif 'vac' in name.lower():
+                name += " (Virtual Audio Cable)"
+            
+            input_devices.append({
+                'index': idx,
+                'name': name,
+                'channels': device['max_input_channels'],
+                'samplerate': int(device['default_samplerate']),
+                'is_loopback': any(keyword in device['name'].lower() 
+                                 for keyword in ['loopback', 'stereo mix', 'monitor']),
+                'is_virtual_cable': any(keyword in device['name'].lower() 
+                                      for keyword in ['cable', 'vac', 'virtual']),
+                'is_wasapi': (WASAPI_HOST_API is not None and device['hostapi'] == WASAPI_HOST_API)
+            })
+    
+    return input_devices
+
+def auto_detect_loopback_device():
+    """Auto-detect the best loopback device, preferring WASAPI devices for call compatibility"""
+    devices = get_available_input_devices()
+    
+    # First priority: Stereo Mix with 2ch 48000Hz (ideal configuration)
+    # Prefer WASAPI version if available
+    ideal_devices = [d for d in devices if (d['is_loopback'] and 
+                                          d['channels'] == 2 and 
+                                          d['samplerate'] == 48000 and
+                                          'stereo mix' in d['name'].lower())]
+    if ideal_devices:
+        # Prefer WASAPI device if available
+        wasapi_ideal = [d for d in ideal_devices if d.get('is_wasapi', False)]
+        if wasapi_ideal:
+            device = wasapi_ideal[0]
+            print(f"Found ideal WASAPI Stereo Mix device: {device['name']}")
+            return device['index'], device['samplerate']
+        else:
+            device = ideal_devices[0]
+            print(f"Found ideal Stereo Mix device: {device['name']}")
+            return device['index'], device['samplerate']
+    
+    # Second priority: Virtual Audio Cables (best for app-specific capture)
+    virtual_devices = [d for d in devices if d.get('is_virtual_cable', False)]
+    if virtual_devices:
+        # Prefer WASAPI version if available
+        wasapi_virtual = [d for d in virtual_devices if d.get('is_wasapi', False)]
+        if wasapi_virtual:
+            device = wasapi_virtual[0]
+            print(f"Found WASAPI Virtual Audio Cable: {device['name']}")
+            return device['index'], device['samplerate']
+        else:
+            device = virtual_devices[0]
+            print(f"Found Virtual Audio Cable: {device['name']}")
+            return device['index'], device['samplerate']
+    
+    # Third priority: Any Stereo Mix device
+    stereo_devices = [d for d in devices if (d['is_loopback'] and 'stereo mix' in d['name'].lower())]
+    if stereo_devices:
+        # Prefer WASAPI version if available
+        wasapi_stereo = [d for d in stereo_devices if d.get('is_wasapi', False)]
+        if wasapi_stereo:
+            device = wasapi_stereo[0]
+            print(f"Found WASAPI Stereo Mix device: {device['name']}")
+            return device['index'], device['samplerate']
+        else:
+            device = stereo_devices[0]
+            print(f"Found Stereo Mix device: {device['name']}")
+            return device['index'], device['samplerate']
+    
+    # Fourth priority: Other loopback devices
+    loopback_devices = [d for d in devices if d['is_loopback']]
+    if loopback_devices:
+        # Prefer WASAPI version if available
+        wasapi_loopback = [d for d in loopback_devices if d.get('is_wasapi', False)]
+        if wasapi_loopback:
+            device = wasapi_loopback[0]
+            print(f"Found WASAPI loopback device: {device['name']}")
+            return device['index'], device['samplerate']
+        else:
+            device = loopback_devices[0]
+            print(f"Found other loopback device: {device['name']}")
+            return device['index'], device['samplerate']
+    
+    # Last resort: use any input device with 2+ channels
+    fallback_devices = [d for d in devices if d['channels'] >= 2]
+    if fallback_devices:
+        # Prefer WASAPI version if available
+        wasapi_fallback = [d for d in fallback_devices if d.get('is_wasapi', False)]
+        if wasapi_fallback:
+            device = wasapi_fallback[0]
+            print(f"Using WASAPI fallback input device: {device['name']}")
+            return device['index'], device['samplerate']
+        else:
+            device = fallback_devices[0]
+            print(f"Using fallback input device: {device['name']}")
+            return device['index'], device['samplerate']
+    
+    raise RuntimeError("No suitable audio input device found!")
+
+def initialize_audio_device():
+    """Initialize the global DEVICE_INDEX with the best available audio device"""
+    global DEVICE_INDEX, SAMPLE_RATE
+    
+    try:
+        print("=== Initializing Audio Device ===")
+        
+        # Show available devices in debug mode
+        if DEBUG_MODE:
+            devices = get_available_input_devices()
+            print(f"Found {len(devices)} input devices:")
+            for device in devices:
+                device_type = []
+                if device.get('is_loopback'):
+                    device_type.append("Loopback")
+                if device.get('is_virtual_cable'):
+                    device_type.append("Virtual Cable")
+                if not device_type:
+                    device_type.append("Standard Input")
+                
+                type_str = " + ".join(device_type)
+                print(f"  {device['index']:2d}: {device['name']} ({type_str}, {device['channels']}ch, {device['samplerate']}Hz)")
+            print()
+        
+        best_device_index, best_sample_rate = auto_detect_loopback_device()
+        
+        # Update global settings
+        DEVICE_INDEX = best_device_index
+        SAMPLE_RATE = best_sample_rate
+        
+        # Get device info for reporting
+        device_info = sd.query_devices(best_device_index)
+        device_name = device_info['name']
+        
+        print(f"✅ Selected audio device: {device_name} (Index: {best_device_index}, Rate: {best_sample_rate}Hz)")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize audio device: {e}")
+        print("Using default fallback settings...")
+        DEVICE_INDEX = None
+        return False
+
+# ──────────────────────────── LOOP-BACK DISCOVERY ───────────────────── #
+def get_loopback_device(device_index=None) -> tuple[int, int]:
+    """
+    Return (device_index, samplerate) of specified device or auto-detect.
+    """
+    if device_index is not None and device_index != -1:
+        device_info = sd.query_devices(device_index)
+        print(f"Using specified device {device_index}: {device_info['name']}")
+        return device_index, int(device_info['default_samplerate'])
+    
+    # Auto-detection
+    if DEBUG_MODE:
+        print("=== Audio Device Auto-Detection ===")
+        devices = sd.query_devices()
+        print(f"Found {len(devices)} audio devices:")
+        for idx, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                print(f"  {idx}: {dev['name']} (inputs: {dev['max_input_channels']}, rate: {dev['default_samplerate']})")
+    
+    return auto_detect_loopback_device()
+
+# ────────────────────────────   THREADS   ───────────────────────────── #
+class AudioWorker(threading.Thread):
+    """
+    Captures CHUNK_SECONDS of stereo PCM from the selected device,
+    down-mixes to mono, and puts it on a queue for the NLP worker.
+    Optimized for low latency and memory usage.
+    """
+    def __init__(self, q: queue.Queue, stop_evt: threading.Event, device_index=None):
+        super().__init__(daemon=True)
+        self.q, self.stop_evt = q, stop_evt
+        self.device, self.rate = get_loopback_device(device_index)
+        # Store sample rate in queue for NLP worker to access
+        self.q._audio_rate = self.rate
+
+    def run(self):
+        try:
+            frames = int(CHUNK_SECONDS * self.rate)
+            print(f"AudioWorker: Starting capture with device {self.device}, rate {self.rate}, frames {frames}")
+            
+            # Configure stream settings for better compatibility during calls
+            stream_settings = {
+                'device': self.device,
+                'samplerate': self.rate,
+                'channels': 2,
+                'dtype': "float32",
+                'blocksize': frames,
+                'latency': 'low'
+            }
+            
+            # Add WASAPI-specific settings for Windows to ensure shared mode
+            if platform.system() == "Windows" and WASAPI_HOST_API is not None and WASAPI_SETTINGS is not None:
+                try:
+                    # Check if the selected device supports WASAPI
+                    device_info = sd.query_devices(self.device)
+                    if device_info['hostapi'] == WASAPI_HOST_API:
+                        stream_settings['extra_settings'] = WASAPI_SETTINGS
+                        if DEBUG_MODE:
+                            print(f"AudioWorker: Using WASAPI shared mode for device {self.device}")
+                    else:
+                        if DEBUG_MODE:
+                            print(f"AudioWorker: Device {self.device} not on WASAPI host API, using default settings")
+                except Exception as e:
+                    if DEBUG_MODE:
+                        print(f"AudioWorker: Could not apply WASAPI settings: {e}")
+            
+            with sd.InputStream(**stream_settings) as stream:
+                chunk_count = 0
+                while not self.stop_evt.is_set():
+                    buf, overflowed = stream.read(frames)
+                    if overflowed and DEBUG_MODE:
+                        print("Audio buffer overflow detected!")
+                    
+                    mono = buf.mean(axis=1)          # L+R → mono
+                    
+                    # Check if we're getting actual audio data
+                    audio_level = np.abs(mono).max()
+                    if DEBUG_MODE and chunk_count % 10 == 0:  # Reduced debug frequency
+                        print(f"Audio chunk {chunk_count}: level={audio_level:.4f}, size={len(mono)}")
+                    
+                    # Skip if queue is too full to prevent memory buildup
+                    if self.q.qsize() >= MAX_QUEUE_SIZE:
+                        if DEBUG_MODE:
+                            print("Queue full, dropping audio chunk")
+                        continue
+                    
+                    self.q.put_nowait(mono.copy())
+                    chunk_count += 1
+        except Exception as e:
+            print(f"AudioWorker error: {e}")
+            if DEBUG_MODE:
+                traceback.print_exc()
+
+class NLPWorker(QtCore.QObject, threading.Thread):
+    """
+    Thread + QObject so we get Qt signals *and* easy Python threading.
+    Uses Faster-Whisper for improved performance.
+    """
+    new_line = QtCore.pyqtSignal(str)
+    clear_overlay = QtCore.pyqtSignal()
+
+    def __init__(self, q: queue.Queue, stop_evt: threading.Event, target_code: str, source_lang: str = None, audio_threshold: float = DEFAULT_AUDIO_THRESHOLD, model_name: str = "turbo"):
+        QtCore.QObject.__init__(self)
+        threading.Thread.__init__(self, daemon=True)
+        self.q, self.stop_evt = q, stop_evt
+        self.target_lang = target_code
+        self.source_lang = source_lang
+        self.audio_threshold = audio_threshold
+        self.model_name = model_name
+        self.last_speech_time = time.time()
+        self.clear_delay = 2.0
+        
+        print(f"Loading Faster-Whisper model '{model_name}'...")
+        compute_type = "int8" if model_name in ["large-v3", "distil-large-v3"] else "float16"
+        self.model = WhisperModel(
+            model_name, 
+            device="cuda" if torch.cuda.is_available() else "cpu", 
+            compute_type=compute_type,
+            num_workers=1,
+            download_root=None,
+            local_files_only=False
+        )
+        print(f"Faster-Whisper model '{model_name}' loaded successfully!")
+        
+        self.translator = Translator()
+        print("Translator initialized!")
+        
+        if self.source_lang:
+            print(f"Whisper will transcribe from: {self.source_lang}")
+        else:
+            print("Whisper will auto-detect source language")
+        
+        self._resample_ratio = None
+        self._target_sample_rate = 16000
+
+    def _languages_match(self, detected_lang, target_lang):
+        """
+        Check if the detected language matches the target language.
+        Handles language code mappings and variations.
+        """
+        if not detected_lang or not target_lang:
+            return False
+        
+        # Normalize language codes to lowercase
+        detected_lang = detected_lang.lower()
+        target_lang = target_lang.lower()
+        
+        # Direct match
+        if detected_lang == target_lang:
+            return True
+        
+        # Language code mappings for common variations
+        language_mappings = {
+            'en': ['en', 'english'],
+            'es': ['es', 'spanish', 'castilian'],
+            'fr': ['fr', 'french'],
+            'de': ['de', 'german'],
+            'it': ['it', 'italian'],
+            'pt': ['pt', 'portuguese'],
+            'ru': ['ru', 'russian'],
+            'zh': ['zh', 'zh-cn', 'zh-tw', 'chinese'],
+            'ja': ['ja', 'japanese'],
+            'ko': ['ko', 'korean'],
+            'ar': ['ar', 'arabic'],
+            'hi': ['hi', 'hindi'],
+            'nl': ['nl', 'dutch', 'flemish'],
+            'ca': ['ca', 'catalan', 'valencian'],
+            'no': ['no', 'norwegian', 'nynorsk'],
+            'sv': ['sv', 'swedish'],
+            'da': ['da', 'danish'],
+            'fi': ['fi', 'finnish'],
+            'pl': ['pl', 'polish'],
+            'tr': ['tr', 'turkish'],
+            'he': ['he', 'iw', 'hebrew'],
+            'th': ['th', 'thai'],
+            'vi': ['vi', 'vietnamese'],
+            'uk': ['uk', 'ukrainian'],
+            'cs': ['cs', 'czech'],
+            'hu': ['hu', 'hungarian'],
+            'ro': ['ro', 'romanian'],
+            'bg': ['bg', 'bulgarian'],
+            'hr': ['hr', 'croatian'],
+            'sk': ['sk', 'slovak'],
+            'sl': ['sl', 'slovenian'],
+            'et': ['et', 'estonian'],
+            'lv': ['lv', 'latvian'],
+            'lt': ['lt', 'lithuanian'],
+            'mt': ['mt', 'maltese'],
+            'ga': ['ga', 'irish'],
+            'cy': ['cy', 'welsh'],
+            'eu': ['eu', 'basque'],
+            'gl': ['gl', 'galician'],
+            'is': ['is', 'icelandic'],
+            'mk': ['mk', 'macedonian'],
+            'be': ['be', 'belarusian'],
+            'sq': ['sq', 'albanian'],
+            'sr': ['sr', 'serbian'],
+            'bs': ['bs', 'bosnian'],
+            'el': ['el', 'greek'],
+            'fa': ['fa', 'persian'],
+            'ur': ['ur', 'urdu'],
+            'bn': ['bn', 'bengali'],
+            'ta': ['ta', 'tamil'],
+            'te': ['te', 'telugu'],
+            'kn': ['kn', 'kannada'],
+            'ml': ['ml', 'malayalam'],
+            'gu': ['gu', 'gujarati'],
+            'pa': ['pa', 'punjabi'],
+            'mr': ['mr', 'marathi'],
+            'ne': ['ne', 'nepali'],
+            'si': ['si', 'sinhala'],
+            'my': ['my', 'burmese', 'myanmar'],
+            'km': ['km', 'khmer'],
+            'lo': ['lo', 'lao'],
+            'ka': ['ka', 'georgian'],
+            'am': ['am', 'amharic'],
+            'sw': ['sw', 'swahili'],
+            'zu': ['zu', 'zulu'],
+            'af': ['af', 'afrikaans'],
+            'ms': ['ms', 'malay'],
+            'tl': ['tl', 'tagalog'],
+            'id': ['id', 'indonesian'],
+            'jv': ['jv', 'jw', 'javanese'],
+            'su': ['su', 'sundanese']
+        }
+        
+        # Check if both languages belong to the same group
+        for lang_code, variations in language_mappings.items():
+            if detected_lang in variations and target_lang in variations:
+                return True
+        
+        # Handle Chinese variants specifically
+        chinese_variants = ['zh', 'zh-cn', 'zh-tw', 'chinese']
+        if detected_lang in chinese_variants and target_lang in chinese_variants:
+            return True
+        
+        return False
+
+    def run(self):
+        print("NLPWorker: Starting processing loop...")
+        processed_count = 0
+        
+        while not self.stop_evt.is_set():
+            try:
+                audio = self.q.get(timeout=0.1)
+            except queue.Empty:
+                # Check if we should clear the overlay due to silence
+                current_time = time.time()
+                if (current_time - self.last_speech_time) > self.clear_delay:
+                    if DEBUG_MODE:
+                        print(f"Clearing overlay due to {self.clear_delay}s of silence")
+                    self.clear_overlay.emit()
+                    self.last_speech_time = current_time  # Reset to prevent repeated clearing
+                continue
+
+            try:
+                # Check audio data quality
+                audio_level = np.abs(audio).max()
+                
+                if DEBUG_MODE:
+                    print(f"Processing audio chunk {processed_count}: level={audio_level:.4f}, length={len(audio)}")
+                
+                # Skip if audio is too quiet (likely silence)
+                if audio_level < self.audio_threshold:
+                    if DEBUG_MODE:
+                        print(f"Skipping quiet audio chunk (level {audio_level:.4f} < threshold {self.audio_threshold:.4f})")
+                    continue
+
+                if DEBUG_MODE:
+                    print(f"Transcribing audio chunk {processed_count}...")
+                
+                # Optimized audio preprocessing
+                current_sample_rate = self.q._audio_rate if hasattr(self.q, '_audio_rate') else 48000
+                
+                if self._resample_ratio is None:
+                    self._resample_ratio = self._target_sample_rate / current_sample_rate
+                
+                if current_sample_rate != self._target_sample_rate:
+                    # More efficient resampling
+                    target_length = int(len(audio) * self._resample_ratio)
+                    audio = signal.resample(audio, target_length).astype(np.float32)
+                
+                # Normalize audio more efficiently
+                max_val = np.abs(audio).max()
+                if max_val > 0:
+                    audio = audio * (0.9 / max_val)
+                
+                # Use faster-whisper API with optimized settings
+                segments, info = self.model.transcribe(
+                    audio, 
+                    language=self.source_lang,
+                    beam_size=1,  # Keep beam size low for speed
+                    no_speech_threshold=0.6,
+                    condition_on_previous_text=False,
+                    vad_filter=True,  # Enable VAD filtering
+                    vad_parameters=dict(min_silence_duration_ms=500)  # Faster VAD response
+                )
+                
+                # More efficient text extraction
+                transcribed_text = " ".join(segment.text for segment in segments).strip()
+                
+                # Get detected language if auto-detecting
+                detected_language = None
+                if self.source_lang is None and hasattr(info, 'language'):
+                    detected_language = info.language
+                    if DEBUG_MODE:
+                        print(f"Detected language: {detected_language}")
+                
+                if DEBUG_MODE:
+                    print(f"Transcription result: '{transcribed_text}'")
+                
+                if not transcribed_text:
+                    if DEBUG_MODE:
+                        print("Skipping empty transcription")
+                    continue
+                
+                # Check if detected language matches target language (skip translation if same)
+                if (detected_language and 
+                    self._languages_match(detected_language, self.target_lang)):
+                    if DEBUG_MODE:
+                        print(f"🔄 Detected language '{detected_language}' matches target '{self.target_lang}', skipping subtitle display")
+                    # Update speech time but don't show subtitle
+                    self.last_speech_time = time.time()
+                    continue
+                
+                # Optimized translation logic
+                if DEBUG_MODE:
+                    print(f"🔄 Translating from '{transcribed_text}' to {self.target_lang}...")
+                
+                try:
+                    translation_result = self.translator.translate(transcribed_text, dest=self.target_lang)
+                    translated = translation_result.text
+                    
+                    if DEBUG_MODE:
+                        print(f"✅ Translation successful: '{translated}'")
+                    
+                except Exception as e:
+                    if DEBUG_MODE:
+                        print(f"❌ TRANSLATION FAILED: {e}")
+                    translated = transcribed_text
+                
+                if DEBUG_MODE:
+                    print(f"Final output to overlay: '{translated}'")
+                
+                # Update the last speech time since we successfully processed speech
+                self.last_speech_time = time.time()
+                
+                self.new_line.emit(translated)
+                processed_count += 1
+                
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"Error processing audio chunk: {e}")
+                    traceback.print_exc()
 
 # ─────────────────────────────   UI   ───────────────────────────────── #
 class Overlay(QtWidgets.QWidget):
@@ -961,7 +1908,6 @@ class ControlPanel(QtWidgets.QWidget):
         self.stop_evt = threading.Event()
         self.audio_th = None
         self.nlp_th = None
-        self._restarting = False  # Flag to prevent multiple simultaneous restarts
         
         # Initialize audio devices
         self.refresh_audio_devices()
@@ -1397,7 +2343,7 @@ class ControlPanel(QtWidgets.QWidget):
         except Exception as e:
             print(f"Error refreshing audio devices: {e}")
             # Add a fallback option
-            self.device_combo.addItem(get_ui_text("default_device", "audio_devices"), config.DEVICE_INDEX or 0)
+            self.device_combo.addItem(get_ui_text("default_device", "audio_devices"), DEVICE_INDEX or 0)
     
     def get_selected_device_index(self):
         """Get the currently selected device index"""
@@ -1519,20 +2465,16 @@ class ControlPanel(QtWidgets.QWidget):
         # Connect language save signals
         if hasattr(self, 'source_combo'):
             self.source_combo.currentTextChanged.connect(self.save_all_settings)
-            self.source_combo.currentTextChanged.connect(self.handle_critical_setting_change)
         if hasattr(self, 'combo'):
             self.combo.currentTextChanged.connect(self.save_all_settings)
-            self.combo.currentTextChanged.connect(self.handle_critical_setting_change)
         
         # Connect audio device save signal
         if hasattr(self, 'device_combo'):
             self.device_combo.currentTextChanged.connect(self.save_all_settings)
-            self.device_combo.currentTextChanged.connect(self.handle_critical_setting_change)
         
         # Connect model save signal
         if hasattr(self, 'model_combo'):
             self.model_combo.currentTextChanged.connect(self.save_all_settings)
-            self.model_combo.currentTextChanged.connect(self.handle_critical_setting_change)
         
         # Connect threshold save signal
         if hasattr(self, 'threshold_slider'):
@@ -1544,198 +2486,6 @@ class ControlPanel(QtWidgets.QWidget):
         
         # Note: UI language change is handled by change_ui_language method which calls save_all_settings
 
-    def handle_critical_setting_change(self):
-        """Handle changes to critical settings that require restarting translation"""
-        # Ensure UI is fully initialized first
-        if not hasattr(self, 'audio_th') or not hasattr(self, 'nlp_th'):
-            return
-        
-        # Prevent multiple simultaneous restarts
-        if getattr(self, '_restarting', False):
-            return
-            
-        # Only restart if translation is currently running
-        if self.audio_th and self.audio_th.is_alive():
-            # Set restart flag immediately to prevent multiple triggers
-            self._restarting = True
-            
-            # Temporarily disconnect signals to prevent recursion during restart
-            self.disconnect_critical_signals()
-            
-            try:
-                # Stop current translation with timeout protection
-                self.stop_with_timeout()
-                
-                # Small delay to ensure clean shutdown, then restart
-                QtCore.QTimer.singleShot(500, self.restart_after_setting_change)  # Increased delay
-            except Exception as e:
-                if DEBUG_MODE:
-                    print(f"Error during restart preparation: {e}")
-                    traceback.print_exc()
-                # Reset flag if restart preparation fails
-                self._restarting = False
-                self.reconnect_critical_signals()
-
-    def stop_with_timeout(self):
-        """Stop translation with timeout protection to prevent hanging"""
-        try:
-            self.stop_evt.set()
-            
-            # Give threads time to stop gracefully
-            if self.nlp_th and self.nlp_th.is_alive():
-                self.nlp_th.join(timeout=2.0)  # 2 second timeout
-                if self.nlp_th.is_alive() and DEBUG_MODE:
-                    print("Warning: NLP thread did not stop gracefully")
-            
-            if self.audio_th and self.audio_th.is_alive():
-                self.audio_th.join(timeout=2.0)  # 2 second timeout
-                if self.audio_th.is_alive() and DEBUG_MODE:
-                    print("Warning: Audio thread did not stop gracefully")
-            
-            # Force thread cleanup
-            self.nlp_th = None
-            self.audio_th = None
-            
-            self.overlay.hide()
-            self.btn.setText(get_ui_text("start_translation"))
-            
-            # Reset button styling back to the default blue
-            self.btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                        stop:0 #6875f3, stop:0.2 #5b65f2, stop:0.8 #4c5ce8, stop:1 #3c4ae0);
-                    font-size: 14px;
-                    font-weight: 700;
-                    border-radius: 8px;
-                    color: #ffffff;
-                    margin: 8px 0 12px 0;
-                    border: 2px solid rgba(255, 255, 255, 0.1);
-                    padding: 16px 24px;
-                }
-                QPushButton:hover {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                        stop:0 #7985f4, stop:0.2 #6875f3, stop:0.8 #5b65f2, stop:1 #4c5ce8);
-                    border: 2px solid rgba(255, 255, 255, 0.2);
-                }
-                QPushButton:pressed {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                        stop:0 #4c5ce8, stop:0.2 #3c4ae0, stop:0.8 #2f3694, stop:1 #1e2875);
-                    border: 2px solid rgba(255, 255, 255, 0.05);
-                }
-            """)
-            
-            # Clear queue to free memory
-            while not self.queue.empty():
-                try:
-                    self.queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            # Force garbage collection to free memory
-            gc.collect()
-            
-        except Exception as e:
-            if DEBUG_MODE:
-                print(f"Error stopping translation: {e}")
-                traceback.print_exc()
-
-    def disconnect_critical_signals(self):
-        """Temporarily disconnect critical setting signals"""
-        try:
-            if hasattr(self, 'source_combo') and self.source_combo:
-                try:
-                    self.source_combo.currentTextChanged.disconnect(self.handle_critical_setting_change)
-                except (TypeError, RuntimeError):
-                    pass  # Signal already disconnected or widget destroyed
-            if hasattr(self, 'combo') and self.combo:
-                try:
-                    self.combo.currentTextChanged.disconnect(self.handle_critical_setting_change)
-                except (TypeError, RuntimeError):
-                    pass  # Signal already disconnected or widget destroyed
-            if hasattr(self, 'device_combo') and self.device_combo:
-                try:
-                    self.device_combo.currentTextChanged.disconnect(self.handle_critical_setting_change)
-                except (TypeError, RuntimeError):
-                    pass  # Signal already disconnected or widget destroyed
-            if hasattr(self, 'model_combo') and self.model_combo:
-                try:
-                    self.model_combo.currentTextChanged.disconnect(self.handle_critical_setting_change)
-                except (TypeError, RuntimeError):
-                    pass  # Signal already disconnected or widget destroyed
-        except Exception as e:
-            if DEBUG_MODE:
-                print(f"Error disconnecting signals: {e}")
-
-    def reconnect_critical_signals(self):
-        """Reconnect critical setting signals after restart"""
-        try:
-            if hasattr(self, 'source_combo') and self.source_combo:
-                try:
-                    self.source_combo.currentTextChanged.connect(self.handle_critical_setting_change)
-                except Exception as e:
-                    if DEBUG_MODE:
-                        print(f"Error reconnecting source_combo signal: {e}")
-                    
-            if hasattr(self, 'combo') and self.combo:
-                try:
-                    self.combo.currentTextChanged.connect(self.handle_critical_setting_change)
-                except Exception as e:
-                    if DEBUG_MODE:
-                        print(f"Error reconnecting combo signal: {e}")
-                    
-            if hasattr(self, 'device_combo') and self.device_combo:
-                try:
-                    self.device_combo.currentTextChanged.connect(self.handle_critical_setting_change)
-                except Exception as e:
-                    if DEBUG_MODE:
-                        print(f"Error reconnecting device_combo signal: {e}")
-                    
-            if hasattr(self, 'model_combo') and self.model_combo:
-                try:
-                    self.model_combo.currentTextChanged.connect(self.handle_critical_setting_change)
-                except Exception as e:
-                    if DEBUG_MODE:
-                        print(f"Error reconnecting model_combo signal: {e}")
-                    
-        except Exception as e:
-            if DEBUG_MODE:
-                print(f"Error in reconnect_critical_signals: {e}")
-                traceback.print_exc()
-
-    def restart_after_setting_change(self):
-        """Restart translation after a setting change"""
-        try:
-            # Check if we're still supposed to be restarting
-            if not getattr(self, '_restarting', False):
-                return
-                
-            # Double-check that threads are really stopped
-            if (self.audio_th and self.audio_th.is_alive()) or (self.nlp_th and self.nlp_th.is_alive()):
-                if DEBUG_MODE:
-                    print("Warning: Threads still running, forcing cleanup...")
-                # Force stop event and cleanup
-                self.stop_evt.set()
-                self.audio_th = None
-                self.nlp_th = None
-                # Wait a bit more for cleanup
-                QtCore.QTimer.singleShot(200, self.restart_after_setting_change)
-                return
-            
-            # Clear the stop event for the new session
-            self.stop_evt.clear()
-            
-            # Start new translation
-            self.start()
-                
-        except Exception as e:
-            if DEBUG_MODE:
-                print(f"Error restarting translation: {e}")
-                traceback.print_exc()
-        finally:
-            # Always clear restart flag and reconnect signals
-            self._restarting = False
-            self.reconnect_critical_signals()
-
     def load_all_settings(self):
         """Load all saved settings and update the controls"""
         try:
@@ -1746,7 +2496,7 @@ class ControlPanel(QtWidgets.QWidget):
                 global CURRENT_UI_LANGUAGE
                 saved_ui_language = settings.get("ui_language", "English")
                 if saved_ui_language in get_available_ui_languages():
-                    config.CURRENT_UI_LANGUAGE = saved_ui_language
+                    CURRENT_UI_LANGUAGE = saved_ui_language
                     if hasattr(self, 'ui_language_combo'):
                         # Find the index by internal language name (stored as data)
                         language_index = self.ui_language_combo.findData(saved_ui_language)
@@ -1907,7 +2657,7 @@ class ControlPanel(QtWidgets.QWidget):
         global CURRENT_UI_LANGUAGE
         # Convert native name to internal language key
         internal_language = get_language_by_native_name(native_language_name)
-        config.CURRENT_UI_LANGUAGE = internal_language
+        CURRENT_UI_LANGUAGE = internal_language
         
         # Update all UI text elements
         self.update_ui_text()
@@ -2222,69 +2972,47 @@ class ControlPanel(QtWidgets.QWidget):
         """)
 
     def stop(self):
-        """Stop translation threads with timeout protection"""
-        try:
-            self.stop_evt.set()
-            
-            # Give threads time to stop gracefully with timeout
-            if self.nlp_th and self.nlp_th.is_alive():
-                self.nlp_th.join(timeout=2.0)  # 2 second timeout
-                if self.nlp_th.is_alive():
-                    if DEBUG_MODE:
-                        print("Warning: NLP thread did not stop gracefully")
-            
-            if self.audio_th and self.audio_th.is_alive():
-                self.audio_th.join(timeout=2.0)  # 2 second timeout
-                if self.audio_th.is_alive():
-                    if DEBUG_MODE:
-                        print("Warning: Audio thread did not stop gracefully")
-            
-            # Force thread cleanup
-            self.nlp_th = None
-            self.audio_th = None
-            
-            self.overlay.hide()
-            self.btn.setText(get_ui_text("start_translation"))
-            
-            # Reset button styling back to the default blue
-            self.btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                        stop:0 #6875f3, stop:0.2 #5b65f2, stop:0.8 #4c5ce8, stop:1 #3c4ae0);
-                    font-size: 14px;
-                    font-weight: 700;
-                    border-radius: 8px;
-                    color: #ffffff;
-                    margin: 8px 0 12px 0;
-                    border: 2px solid rgba(255, 255, 255, 0.1);
-                    padding: 16px 24px;
-                }
-                QPushButton:hover {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                        stop:0 #7985f4, stop:0.2 #6875f3, stop:0.8 #5b65f2, stop:1 #4c5ce8);
-                    border: 2px solid rgba(255, 255, 255, 0.2);
-                }
-                QPushButton:pressed {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
-                        stop:0 #4c5ce8, stop:0.2 #3c4ae0, stop:0.8 #2f3694, stop:1 #1e2875);
-                    border: 2px solid rgba(255, 255, 255, 0.05);
-                }
-            """)
-            
-            # Clear queue to free memory
-            while not self.queue.empty():
-                try:
-                    self.queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            # Force garbage collection to free memory
-            gc.collect()
-            
-        except Exception as e:
-            if DEBUG_MODE:
-                print(f"Error stopping translation: {e}")
-                traceback.print_exc()
+        self.stop_evt.set()
+        if self.nlp_th:
+            self.nlp_th.join()
+        if self.audio_th:
+            self.audio_th.join()
+        self.overlay.hide()
+        self.btn.setText(get_ui_text("start_translation"))
+        # Reset button styling back to the default blue
+        self.btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #6875f3, stop:0.2 #5b65f2, stop:0.8 #4c5ce8, stop:1 #3c4ae0);
+                font-size: 14px;
+                font-weight: 700;
+                border-radius: 8px;
+                color: #ffffff;
+                margin: 8px 0 12px 0;
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                padding: 16px 24px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #7985f4, stop:0.2 #6875f3, stop:0.8 #5b65f2, stop:1 #4c5ce8);
+                border: 2px solid rgba(255, 255, 255, 0.2);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, 
+                    stop:0 #4c5ce8, stop:0.2 #3c4ae0, stop:0.8 #2f3694, stop:1 #1e2875);
+                border: 2px solid rgba(255, 255, 255, 0.05);
+            }
+        """)
+        
+        # Clear queue to free memory
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # Force garbage collection to free memory
+        gc.collect()
 
 # ─────────────────────────── entry-point ───────────────────────────── #
 if __name__ == "__main__":
@@ -2305,5 +3033,19 @@ if __name__ == "__main__":
     
     panel = ControlPanel()
     panel.show()
+    
+    print("Babel Audio Translator")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("✨ Features:")
+    print("  • Sleek modern interface with dark theme")
+    print("  • Smart audio device auto-detection")
+    print("  • Multi-language transcription & translation")
+    print("  • Optimized Whisper models for speed vs accuracy")
+    print("  • Adjustable audio sensitivity controls")
+    print("  • Drag-and-drop subtitle positioning")
+    print("  • Performance mode for low CPU/memory usage")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("🚀 Ready to translate!")
+    print("")
     
     sys.exit(app.exec_())

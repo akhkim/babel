@@ -1,12 +1,14 @@
 {
-  "audio_device_data": -1,
-  "audio_threshold": 0.001,
-  "source_language": "English",
-  "target_language": "Korean",
-  "whisper_model": "turbo",
-  "ui_language": "English",
+  "subtitle_y_offset": 184,
+  "subtitle_x_offset": -5,
   "font_family": "Segoe UI",
   "font_size": 16,
+  "source_language": "Auto-detect",
+  "target_language": "Korean",
   "audio_device": "Auto (Recommended)",
-  "performance_mode": false
+  "audio_device_data": -1,
+  "whisper_model": "turbo",
+  "audio_threshold": 0.001,
+  "performance_mode": false,
+  "ui_language": "English"
 }
